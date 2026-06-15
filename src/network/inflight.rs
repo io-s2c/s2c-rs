@@ -1,7 +1,7 @@
 use crate::network::error::ClientError;
 use crate::proto::io::S2cMessage;
 use std::collections::HashMap;
-use tokio::sync::{oneshot, RwLock};
+use tokio::sync::{RwLock, oneshot};
 
 #[derive(Default)]
 pub struct InflightRequests {

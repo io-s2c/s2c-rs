@@ -2,8 +2,9 @@ use crate::network::error::NetworkError;
 use crate::proto::io::S2cMessage;
 use prost::Message;
 use std::collections::VecDeque;
-use tokio::io::{AsyncReadExt, BufReader};
-use tokio::net::tcp::OwnedReadHalf;
+use std::io::{Error, ErrorKind};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 
 pub trait S2cMessageReader {
     fn read_next_message(
@@ -73,12 +74,12 @@ impl S2cMessageReader for S2CMessageReaderImpl {
         let msg_size = reader
             .read_u32()
             .await
-            .map_err(|e| NetworkError::Io { err: e.to_string() })?;
+            .map_err(|e| NetworkError::Io { err: e })?;
         if msg_size > self.max_message_size {
             let mut skip_stream = reader.take(msg_size as u64);
             tokio::io::copy(&mut skip_stream, &mut tokio::io::sink())
                 .await
-                .map_err(|e| NetworkError::Io { err: e.to_string() })?;
+                .map_err(|e| NetworkError::Io { err: e })?;
             return Err(NetworkError::MessageTooLarge {
                 size: msg_size,
                 max: self.max_message_size,
@@ -91,7 +92,7 @@ impl S2cMessageReader for S2CMessageReaderImpl {
         reader
             .read_exact(&mut self.buf[..msg_size as usize])
             .await
-            .map_err(|e| NetworkError::Io { err: e.to_string() })?;
+            .map_err(|e| NetworkError::Io { err: e })?;
         S2cMessage::decode(&self.buf[..msg_size as usize])
             .map_err(|e| NetworkError::InvalidProtobuf { err: e.to_string() })
     }
@@ -126,7 +127,7 @@ where
                 match failure {
                     Failure::Io => {
                         return Err(NetworkError::Io {
-                            err: "Error".to_string(),
+                            err: Error::new(ErrorKind::Other, "some error"),
                         });
                     }
                     Failure::Drop => {
@@ -138,4 +139,23 @@ where
             }
         }
     }
+}
+
+
+
+
+pub async fn write_message(
+    writer: &mut BufWriter<OwnedWriteHalf>,
+    out_msg: S2cMessage,
+    out_buf: &mut Vec<u8>,
+) -> Result<(), std::io::Error> {
+    out_buf.resize(out_msg.encoded_len(), 0u8);
+    if let Err(err) = out_msg.encode(out_buf) {
+        // This should never happen, as the buffer is resized before encoding.
+        tracing::error!(error = err.to_string(), "Failed encoding message")
+    } else {
+        writer.write_u32(out_msg.encoded_len() as u32).await?;
+        writer.write_all(&out_buf).await?;
+    }
+    Ok(())
 }

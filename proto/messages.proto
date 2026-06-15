@@ -25,6 +25,7 @@ message S2CMessage {
     SlowDownError slow_down_error = 13;
     InternalError internal_error = 14;
     RequestOutOfSequenceError request_out_of_sequence_error = 15;
+    UnknownGroupError unknown_group_error = 16;
   }
 }
 
@@ -120,5 +121,9 @@ message SlowDownError {
 }
 
 message FollowerTooFarBehindError {
+
+}
+
+message UnknownGroupError {
 
 }

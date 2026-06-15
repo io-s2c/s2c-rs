@@ -2,7 +2,6 @@ use thiserror::Error;
 
 #[derive(Error, Debug, Clone)]
 pub enum S2CError {
-
     #[error("application result unavailable")]
     ApplicationResultUnavailable,
 
@@ -30,10 +29,8 @@ pub enum S2CError {
     #[error("log replayer broken: {0}")]
     ReplayerBroken(String),
 
-
-
     #[error("IO error: {0}")]
-    Io(String)
+    Io(String),
 }
 
 impl From<std::io::Error> for S2CError {
@@ -41,4 +38,3 @@ impl From<std::io::Error> for S2CError {
         S2CError::Io(err.to_string())
     }
 }
-

@@ -3,13 +3,13 @@ use thiserror::Error;
 #[derive(Error, Debug)]
 pub enum NetworkError {
     #[error("Io error: {err}")]
-    Io {err: String},
+    Io { err: std::io::Error },
 
     #[error("message size {size} too big. Max allowed {max}")]
     MessageTooLarge { max: u32, size: u32 },
 
     #[error("Invalid protobuf: {err}")]
-    InvalidProtobuf {err: String},
+    InvalidProtobuf { err: String },
 }
 
 #[derive(Error, Debug, Clone)]

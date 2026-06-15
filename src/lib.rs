@@ -1,7 +1,8 @@
-pub mod network;
-mod context;
+mod backoff;
 mod config;
+mod context;
 mod error;
+pub mod network;
 
 pub mod proto {
     pub mod io {

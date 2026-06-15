@@ -8,15 +8,17 @@ pub struct Context {
 }
 
 impl Context {
-    pub fn new(s2c_group_id: impl Into<String>, node_identity: NodeIdentity, log_node_identity: bool) -> Self {
-
+    pub fn new(
+        s2c_group_id: impl Into<String>,
+        node_identity: NodeIdentity,
+        log_node_identity: bool,
+    ) -> Self {
         Self {
             s2c_group_id: s2c_group_id.into(),
             port_str: node_identity.port.to_string(),
             log_node_identity,
             node_identity,
         }
-
     }
 
     pub fn s2c_group_id(&self) -> &str {

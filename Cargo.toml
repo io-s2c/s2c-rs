@@ -15,6 +15,7 @@ log = "0.4.29"
 tracing = "0.1.44"
 uuid = { version = "1.23.1", features = ["v4"] }
 tokio-util = { version = "0.7.18", features = ["full"] }
+rand = "0.10.1"
 
 [build-dependencies]
 prost-build = "0.14.3"
