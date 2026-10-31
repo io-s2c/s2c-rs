@@ -6,19 +6,7 @@ message StateSnapshot {
 	uint64 start_apply_index = 1;
 	uint64 end_apply_index = 2;
 	uint64 leader_epoch = 3;
-	repeated StateMachineSnapshot sm_snapshots = 4;
-	repeated LastResult last_results = 5;
-}
-
-message LastResult {
-	bytes result = 1;
-	uint64 last_seq_num = 2;
-	NodeIdentity node_identity = 3;
-}
-
-message StateMachineSnapshot {
-	string sm_name = 1;
-	bytes body = 2;
+  bytes body = 4;
 }
 
 message NodeIdentity {
@@ -28,27 +16,23 @@ message NodeIdentity {
   string az = 4;
 }
 
-message LogEntry {
+message BatchEntry {
   bytes body = 1;
-  string source_sm = 2;
-  RequestId request_id = 3;
-  bool internal = 4;
+  bool internal = 2;
 }
 
-message RequestId {
-  NodeIdentity client_node_identity = 1;
-  uint64 client_sequence_number = 2;
+message Batch {
+  repeated BatchEntry entries = 1;
 }
 
-message LogEntriesBatch {
-  repeated LogEntry log_entries = 1;
-  uint64 commit_index = 2;
+message LogEntry {
+  Batch batch = 1;
+  LeaderState leader_state = 2;
 }
 
 message FollowerInfo {
   NodeIdentity node_identity = 1;
-  uint64 synchronized_apply_index = 2;
-  uint64 sequence_number = 3;
+  uint64 replicated_apply_index = 2;
 }
 
 message LeaderState {

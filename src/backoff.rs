@@ -5,15 +5,13 @@ use std::time::Duration;
 use tokio::time::sleep;
 
 pub struct BackoffCounter<'a> {
-    name: String,
     current_attempt: u32,
     s2c_retry_options: &'a S2cRetryOptions,
 }
 
 impl<'a> BackoffCounter<'a> {
-    pub fn new(name: impl Into<String>, s2c_retry_options: &'a S2cRetryOptions) -> Self {
+    pub fn new(s2c_retry_options: &'a S2cRetryOptions) -> Self {
         Self {
-            name: name.into(),
             current_attempt: 0,
             s2c_retry_options,
         }
@@ -26,7 +24,6 @@ impl<'a> BackoffCounter<'a> {
         self.current_attempt += 1;
         let next_duration_ms = self.calculate_duration(self.current_attempt).as_millis() as u64;
         tracing::debug!(
-            retrier = self.name,
             current_attempt = self.current_attempt,
             max_attempts = self.s2c_retry_options.max_attempts,
             delay_sec = format!("{:.2}", next_duration_ms as f64 / 1000.0),

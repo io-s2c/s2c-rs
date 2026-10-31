@@ -1,21 +1,26 @@
 use crate::config::S2cOptions;
 use crate::context::Context;
+use crate::fsm::MessageReaderFactory;
 use crate::network::client::ClientState::{Closed, Connected, NotConnected, Ready};
 use crate::network::error::{ClientError, NetworkError};
 use crate::network::inflight::InflightRequests;
-use crate::network::message_rw::{write_message, S2cMessageReader};
-use crate::proto::io::s2c_message::{Body, Error};
+use crate::network::message_rw::{write_bytes, S2cMessageReader};
+use crate::proto::io::s2c_message::{Body, Error as S2cError};
 use crate::proto::io::{Handshake, NodeIdentity, S2cMessage};
 use prost::Message;
 use std::cmp::PartialEq;
+use std::error::Error;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncWriteExt, BufReader, BufWriter};
+use tokio::io::{BufReader, BufWriter};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::{Mutex, RwLock};
+use tokio_util::bytes::Bytes;
+use tokio_util::future::FutureExt;
+use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use uuid::Uuid;
 
@@ -28,7 +33,9 @@ enum ClientState {
     Closed,
 }
 
-struct AtomicClientState(AtomicU8);
+pub struct AtomicClientState(AtomicU8);
+
+pub type MessageReader = Box<dyn S2cMessageReader + 'static + Send + Sync>;
 
 impl AtomicClientState {
     fn new() -> Self {
@@ -49,40 +56,33 @@ impl AtomicClientState {
     }
 }
 
-struct S2cClient<T, F>
-where
-    T: S2cMessageReader + Send + 'static,
-    F: Fn() -> T,
+pub struct S2cClient
 {
     s2c_options: &'static S2cOptions,
     context: &'static Context,
     inflight_requests: Arc<InflightRequests>,
-    message_reader_factory: F,
+    message_reader_factory: Arc<MessageReaderFactory>,
     throttle: Arc<AtomicBool>,
     client_state: Arc<AtomicClientState>,
-    sender: Arc<Sender<Option<S2cMessage>>>,
-    // We use mutex because receiver needs to be mutable
-    receiver: Arc<Mutex<Receiver<Option<S2cMessage>>>>,
+    sender: Arc<Sender<Bytes>>,
+    receiver: Arc<Mutex<Receiver<Bytes>>>,
     rw_lock: RwLock<()>,
     task_tracker: TaskTracker,
+    cancellation_token: CancellationToken,
 }
 
-impl<T, F> S2cClient<T, F>
-where
-    T: S2cMessageReader + Send + 'static,
-    F: Fn() -> T,
+impl S2cClient
 {
     pub fn new(
         s2c_options: &'static S2cOptions,
         context: &'static Context,
-        message_reader_factory: F,
-        inflight_requests: InflightRequests,
+        message_reader_factory: Arc<MessageReaderFactory>,
     ) -> Self {
         let (sender, receiver) = channel(s2c_options.network.max_pending_reqs_per_client as usize);
         Self {
             s2c_options,
             context,
-            inflight_requests: Arc::new(inflight_requests),
+            inflight_requests: Arc::new(InflightRequests::new()),
             message_reader_factory,
             throttle: Arc::new(AtomicBool::new(false)),
             client_state: Arc::new(AtomicClientState::new()),
@@ -90,13 +90,13 @@ where
             receiver: Arc::new(Mutex::new(receiver)),
             rw_lock: RwLock::new(()),
             task_tracker: TaskTracker::new(),
+            cancellation_token: CancellationToken::new(),
         }
     }
 
     pub async fn connect(&self, server_node_id: &NodeIdentity) -> Result<(), ClientError> {
         let _guard = self.rw_lock.write().await;
         if self.client_state.load() == NotConnected {
-            // Ensure drainers are closed from last run
             if self.task_tracker.close() {
                 self.task_tracker.wait().await;
             }
@@ -105,12 +105,12 @@ where
 
             let addr = format!("{}:{}", server_node_id.address, server_node_id.port);
             let tcp_stream = tokio::time::timeout(
-                tokio::time::Duration::from_millis(self.s2c_options.network.connect_timeout_ms),
+                Duration::from_millis(self.s2c_options.network.connect_timeout_ms as u64),
                 TcpStream::connect(addr),
             )
             .await
             .map_err(|_| ClientError::ConnectTimeout)?
-            .map_err(|e| ClientError::Io(e.to_string()))?;
+            .map_err(|e| ClientError::Io { err: NetworkError::Io { kind: e.kind(), msg: e.to_string() }})?;
 
             self.client_state.store(Connected);
 
@@ -127,14 +127,11 @@ where
                     self.client_state.store(Ready);
                     Ok(())
                 }
-                // Reset
                 Err(e) => {
                     self.client_state.store(NotConnected);
-
-                    if let Err(err) = self.sender.send(None).await {
-                        tracing::debug!("Error while sending {:?}", err)
-                    };
                     if self.task_tracker.close() {
+                        self.cancellation_token.cancel();
+                        self.cancellation_token.cancelled().await;
                         self.task_tracker.wait().await;
                     }
                     Err(e)
@@ -146,7 +143,12 @@ where
         }
     }
 
-    pub async fn send(&self, message: S2cMessage, timeout: u64) -> Result<S2cMessage, ClientError> {
+    pub async fn send(
+        &self,
+        correlation_id: String,
+        payload: Bytes,
+        timeout: usize,
+    ) -> Result<S2cMessage, ClientError> {
         {
             let _guard = self.rw_lock.read().await;
             let state = self.client_state.load();
@@ -157,24 +159,26 @@ where
                 return Err(ClientError::NotConnected);
             }
         }
-        self.send_and_await_response(message, timeout).await
+        self.send_and_await_response(correlation_id, payload, timeout)
+            .await
     }
 
     fn spawn_drain_in(&self, buf_reader: BufReader<OwnedReadHalf>) {
         let client_state = self.client_state.clone();
         let message_reader = (self.message_reader_factory)();
         let inflight_requests = self.inflight_requests.clone();
-        let sender = self.sender.clone();
         let throttle = self.throttle.clone();
+        let cancellation_token = self.cancellation_token.clone();
         self.task_tracker.spawn(async move {
             Self::drain_in(
                 buf_reader,
                 client_state,
                 message_reader,
                 inflight_requests,
-                sender,
+                cancellation_token.clone(),
                 throttle,
             )
+            .with_cancellation_token(&cancellation_token)
             .await
         });
     }
@@ -184,24 +188,27 @@ where
         let receiver = self.receiver.clone();
         let throttle = self.throttle.clone();
         let s2c_options = self.s2c_options;
+        let cancellation_token = self.cancellation_token.clone();
         self.task_tracker.spawn(async move {
-            Self::drain_out(buf_writer, receiver, client_state, throttle, s2c_options).await;
+            Self::drain_out(buf_writer, receiver, client_state, throttle, s2c_options)
+                .with_cancellation_token(&cancellation_token)
+                .await;
         });
     }
 
     async fn send_and_await_response(
         &self,
-        msg: S2cMessage,
-        timeout_ms: u64,
+        correlation_id: String,
+        payload: Bytes,
+        timeout_ms: usize,
     ) -> Result<S2cMessage, ClientError> {
-        let correlation_id = msg.correlation_id.clone();
         let receiver = self.inflight_requests.add(correlation_id.clone()).await;
 
-        if let Err(_) = self.sender.send(Some(msg)).await {
+        if let Err(_) = self.sender.send(payload).await {
             return Err(ClientError::NotConnected);
         }
 
-        match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), receiver).await {
+        match tokio::time::timeout(Duration::from_millis(timeout_ms as u64), receiver).await {
             Ok(Ok(Ok(response))) => Ok(response),
             Ok(Ok(Err(e))) => {
                 self.inflight_requests.discard(correlation_id).await;
@@ -228,8 +235,13 @@ where
             error: None,
         };
 
+        let correlation_id = message.correlation_id.clone();
         match self
-            .send_and_await_response(message, self.s2c_options.network.handshake_timeout_ms)
+            .send_and_await_response(
+                correlation_id,
+                Bytes::from(message.encode_to_vec()),
+                self.s2c_options.network.handshake_timeout_ms,
+            )
             .await
         {
             Ok(resp) => {
@@ -248,9 +260,9 @@ where
     async fn drain_in(
         mut reader: BufReader<OwnedReadHalf>,
         client_state: Arc<AtomicClientState>,
-        mut message_reader: T,
+        mut message_reader: MessageReader,
         inflight_requests: Arc<InflightRequests>,
-        sender: Arc<Sender<Option<S2cMessage>>>,
+        cancellation_token: CancellationToken,
         throttle: Arc<AtomicBool>,
     ) {
         loop {
@@ -264,7 +276,7 @@ where
                         return;
                     }
                     if let Some(error) = message.error {
-                        if matches!(error, Error::SlowDownError(_)) {
+                        if matches!(error, S2cError::SlowDownError(_)) {
                             throttle.store(true, Ordering::Release);
                         }
                     } else {
@@ -273,10 +285,10 @@ where
                 }
                 Err(e) => {
                     tracing::error!("Error while reading message {:?}", e.to_string());
-                    inflight_requests.fail_all(&ClientError::Io(e.to_string())).await;
-                    if let Err(err) = sender.send(None).await {
-                        tracing::debug!("Error while sending {:?}", err);
-                    }
+                    inflight_requests
+                        .fail_all(ClientError::Io {err: e})
+                        .await;
+                    cancellation_token.cancel();
                     client_state.store(NotConnected);
                     break;
                 }
@@ -286,28 +298,27 @@ where
 
     async fn drain_out(
         mut writer: BufWriter<OwnedWriteHalf>,
-        receiver: Arc<Mutex<Receiver<Option<S2cMessage>>>>,
+        receiver: Arc<Mutex<Receiver<Bytes>>>,
         client_state: Arc<AtomicClientState>,
         throttle: Arc<AtomicBool>,
         s2c_options: &S2cOptions,
     ) {
         let mut receiver = receiver.lock().await;
-        let mut out_buf: Vec<u8> = vec![0u8; 1024];
         loop {
             if !running(&client_state) {
                 return;
             }
             if throttle.load(Ordering::Acquire) {
-                tokio::time::sleep(Duration::from_millis(s2c_options.network.throttle_delay_ms))
+                tokio::time::sleep(Duration::from_millis(s2c_options.network.throttle_delay_ms as u64))
                     .await;
                 throttle.store(false, Ordering::Release);
             }
             match receiver.recv().await {
-                Some(Some(out_msg)) => {
+                Some(out_msg) => {
                     if !running(&client_state) {
                         return;
                     }
-                    if let Err(e) = write_message(&mut writer, out_msg, &mut out_buf).await {
+                    if let Err(e) = write_bytes(&mut writer, out_msg.clone()).await {
                         client_state.store(NotConnected);
                         break; // Writer dropped, reader clears up
                     }
@@ -321,10 +332,9 @@ where
         let _guard = &self.rw_lock.write().await;
         if self.client_state.load() != Closed {
             self.client_state.store(Closed);
-            if let Err(err) = self.sender.send(None).await {
-                tracing::debug!("Error while sending {:?}", err);
-            }
             if self.task_tracker.close() {
+                self.cancellation_token.cancel();
+                self.cancellation_token.cancelled().await;
                 self.task_tracker.wait().await;
             }
         } else {
@@ -333,7 +343,6 @@ where
     }
 }
 
-fn running(s: &Arc<AtomicClientState>) -> bool {
+pub fn running(s: &Arc<AtomicClientState>) -> bool {
     matches!(s.load(), Ready | Connected)
 }
-

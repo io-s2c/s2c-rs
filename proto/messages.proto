@@ -10,22 +10,21 @@ message S2CMessage {
   oneof body {
     StateRequest state_request = 2;
     StateRequestResponse state_request_response = 3;
-    SynchronizeRequest synchronize_request = 4;
-    SynchronizeResponse synchronize_response = 5;
+    ReplicateRequest replicate_request = 4;
+    ReplicateResponse replicate_response = 5;
 
-    Follow follow = 6;
+    Follow follow =  6;
     FollowResponse follow_response = 7;
     Handshake handshake = 8;
   }
 
   oneof error {
-    NotLeaderError not_leader_error = 10;
-    LeaderStartingError leader_starting_error = 11;
-    NotFollowerError not_follower_error = 12;
-    SlowDownError slow_down_error = 13;
-    InternalError internal_error = 14;
-    RequestOutOfSequenceError request_out_of_sequence_error = 15;
-    UnknownGroupError unknown_group_error = 16;
+    NotLeaderError not_leader_error = 9;
+    LeaderStartingError leader_starting_error = 10;
+    NotFollowerError not_follower_error = 11;
+    SlowDownError slow_down_error = 12;
+    InternalError internal_error = 13;
+    UnknownGroupError unknown_group_error = 14;
   }
 }
 
@@ -42,13 +41,10 @@ message InternalStateRequest {
 
 message StateRequest {
   bytes body = 1;
-  string source_sm = 2;
-  NodeIdentity source_node = 3;
-  StateRequestType type = 4;
-  string group_id = 5;
-  uint64 sequence_number = 6;
-  bool internal = 7;
-  bool leader_command = 8;
+  StateRequestType type = 2;
+  string group_id = 3;
+  bool internal = 4;
+  bool leader_command = 5;
 
   enum StateRequestType {
     COMMAND = 0;
@@ -60,9 +56,6 @@ message StateRequestResponse {
   oneof body {
     ApplicationResult application_result = 1;
   }
-  oneof error {
-    ApplicationResultUnavailableError application_result_unavailable_error = 2;
-  }
 }
 
 message S2CGroupStatusRequest {
@@ -72,11 +65,7 @@ message ApplicationResult {
   bytes body = 1;
 }
 
-message ApplicationResultUnavailableError {
-}
-
 message FollowResponse {
-  uint64 node_sequence_number = 1;
 }
 
 message Follow {
@@ -85,12 +74,12 @@ message Follow {
   string group_id = 3;
 }
 
-message SynchronizeResponse {
+message ReplicateResponse {
   uint64 apply_index = 1;
 }
 
-message SynchronizeRequest {
-  LogEntriesBatch batch = 1;
+message ReplicateRequest {
+  Batch batch = 1;
   uint64 commit_index = 2;
   string group_id = 3;
   FollowerTooFarBehindError follower_too_far_behind_error = 4;
@@ -98,10 +87,6 @@ message SynchronizeRequest {
 
 message InternalError {
 
-}
-
-message RequestOutOfSequenceError {
-  uint64 next_seq_num = 1;
 }
 
 message NotLeaderError {

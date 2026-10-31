@@ -1,21 +1,25 @@
 use crate::backoff::BackoffCounter;
 use crate::config::{S2cOptions, S2cRetryOptions};
 use crate::network::group_server::GroupServer;
-use crate::network::message_rw::{write_message, S2cMessageReader};
+use crate::network::message_rw::{write_bytes, S2cMessageReader};
 use crate::network::server::ServerState::{Binding, Closed, NotBound, Ready};
 use crate::proto::io::s2c_message::Body;
 use crate::proto::io::{Handshake, NodeIdentity, S2cMessage};
 use std::collections::HashMap;
 
+use crate::fsm::MessageReaderFactory;
+use crate::network::client::MessageReader;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use prost::Message;
 use tokio::io::{AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::Mutex;
 use tokio::time;
+use tokio_util::bytes::Bytes;
 use tokio_util::future::FutureExt;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
@@ -61,38 +65,31 @@ impl AtomicServerState {
     }
 }
 
-type GroupServers<T, F> = Arc<Mutex<HashMap<String, GroupServer<T, F>>>>;
+type GroupServers = Arc<Mutex<HashMap<String, GroupServer>>>;
 
-struct S2cServer<T, F>
-where
-    T: S2cMessageReader + Send + 'static,
-    F: Fn() -> T,
-{
+pub struct S2cServer {
     s2c_options: &'static S2cOptions,
-    group_servers: GroupServers<T, F>,
+    group_servers: GroupServers,
     server_state: Arc<AtomicServerState>,
     node_identity: NodeIdentity,
-    message_reader_factory: Arc<F>,
+    message_reader_factory: MessageReaderFactory,
     task_tracker: TaskTracker,
     cancellation_token: CancellationToken,
 }
 
-impl<T, F> S2cServer<T, F>
-where
-    T: S2cMessageReader + Send + 'static,
-    F: Fn() -> T + Send + Sync + 'static,
+impl S2cServer
 {
     pub fn new(
         s2c_options: &'static S2cOptions,
         node_identity: NodeIdentity,
-        message_reader_factory: F,
+        message_reader_factory: MessageReaderFactory,
     ) -> Self {
         Self {
             s2c_options,
             group_servers: Arc::new(Mutex::new(HashMap::new())),
             server_state: Arc::new(AtomicServerState::new()),
             node_identity,
-            message_reader_factory: Arc::new(message_reader_factory),
+            message_reader_factory,
             task_tracker: TaskTracker::new(),
             cancellation_token: CancellationToken::new(),
         }
@@ -134,8 +131,8 @@ where
         port: i32,
         tcp_listener: TcpListener,
         cancellation_token: CancellationToken,
-        message_reader_factory: Arc<F>,
-        group_servers: GroupServers<T, F>,
+        message_reader_factory: MessageReaderFactory,
+        group_servers: GroupServers,
     ) {
         let inner_task_tracker = TaskTracker::new();
         let inner_cancellation_token = CancellationToken::new();
@@ -159,8 +156,8 @@ where
         task_tracker: &TaskTracker,
         tcp_listener: TcpListener,
         cancellation_token: &CancellationToken,
-        message_reader_factory: Arc<F>,
-        group_servers: GroupServers<T, F>,
+        message_reader_factory: MessageReaderFactory,
+        group_servers: GroupServers,
     ) {
         let mut tcp_listener = tcp_listener;
         loop {
@@ -201,7 +198,7 @@ where
         }
     }
 
-    pub async fn register_group_server(&self, group_id: String, group_server: GroupServer<T, F>) {
+    pub async fn register_group_server(&self, group_id: String, group_server: GroupServer) {
         self.group_servers
             .lock()
             .await
@@ -224,7 +221,7 @@ async fn bind(
     port: i32,
     s2c_retry_options: &S2cRetryOptions,
 ) -> Result<TcpListener, std::io::Error> {
-    let mut backoff = BackoffCounter::new("bind", &s2c_retry_options);
+    let mut backoff = BackoffCounter::new(&s2c_retry_options);
     tracing::debug!("Server binding");
     loop {
         match TcpListener::bind(format!("0.0.0.0:{}", port)).await {
@@ -239,18 +236,15 @@ async fn bind(
         }
     }
 }
-async fn start_accept_loop<F, T>(
+async fn start_accept_loop(
     tcp_listener: &TcpListener,
     server_state: &AtomicServerState,
     task_tracker: &TaskTracker,
     cancellation_token: &CancellationToken,
-    message_reader_factory: &Arc<F>,
+    message_reader_factory: &MessageReaderFactory,
     s2c_options: &'static S2cOptions,
-    group_servers: GroupServers<T, F>,
-) where
-    T: S2cMessageReader + Send,
-    F: Fn() -> T + Send + Sync + 'static,
-{
+    group_servers: GroupServers,
+){
     loop {
         if matches!(server_state.load(), Closed) {
             return;
@@ -284,16 +278,13 @@ async fn start_accept_loop<F, T>(
     }
 }
 
-async fn handle_client<T, F>(
+async fn handle_client(
     tcp_stream: TcpStream,
     sock_addr: SocketAddr,
-    message_reader_factory: Arc<F>,
+    message_reader_factory: MessageReaderFactory,
     s2c_options: &S2cOptions,
-    group_servers: GroupServers<T, F>,
-) where
-    T: S2cMessageReader + Send,
-    F: Fn() -> T,
-{
+    group_servers: GroupServers,
+) {
     let (read, write) = tcp_stream.into_split();
     let mut reader = BufReader::new(read);
     let mut writer = BufWriter::new(write);
@@ -301,7 +292,7 @@ async fn handle_client<T, F>(
         &mut reader,
         message_reader_factory(),
         &mut writer,
-        s2c_options.network.handshake_timeout_ms,
+        s2c_options.network.handshake_timeout_ms as u64,
     )
     .await
     {
@@ -326,19 +317,16 @@ async fn write(
     writer: &mut BufWriter<OwnedWriteHalf>,
     msg: S2cMessage,
 ) -> Result<(), std::io::Error> {
-    write_message(writer, msg, &mut Vec::new()).await?;
+    write_bytes(writer, Bytes::from(msg.encode_to_vec())).await?;
     writer.flush().await
 }
 
-async fn handshake<T>(
+async fn handshake(
     reader: &mut BufReader<OwnedReadHalf>,
-    mut message_reader: T,
+    mut message_reader: MessageReader,
     writer: &mut BufWriter<OwnedWriteHalf>,
     timeout: u64,
-) -> Option<Handshake>
-where
-    T: S2cMessageReader,
-{
+) -> Option<Handshake> {
     loop {
         match time::timeout(
             Duration::from_millis(timeout),

@@ -1,7 +1,8 @@
 use crate::network::error::ClientError;
 use crate::proto::io::S2cMessage;
 use std::collections::HashMap;
-use tokio::sync::{RwLock, oneshot};
+use std::sync::Arc;
+use tokio::sync::{oneshot, RwLock};
 
 #[derive(Default)]
 pub struct InflightRequests {
@@ -9,7 +10,7 @@ pub struct InflightRequests {
 }
 
 impl InflightRequests {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self::default()
     }
 
@@ -33,7 +34,7 @@ impl InflightRequests {
         self.requests.write().await.remove(&correlation_id);
     }
 
-    pub async fn fail_all(&self, err: &ClientError) {
+    pub async fn fail_all(&self, err: ClientError) {
         self.requests.write().await.drain().for_each(|(_, tx)| {
             let _ = tx.send(Err(err.clone()));
         });

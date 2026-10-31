@@ -43,9 +43,9 @@ impl Default for S2cOptions {
 }
 
 pub struct S2cNetworkOptions {
-    pub connect_timeout_ms: u64,
-    pub throttle_delay_ms: u64,
-    pub handshake_timeout_ms: u64,
+    pub connect_timeout_ms: usize,
+    pub throttle_delay_ms: usize,
+    pub handshake_timeout_ms: usize,
     pub max_pending_reqs_per_client: u32,
     pub max_pending_resps_per_client: u32,
     pub max_pending_server_responses: u32,
@@ -69,8 +69,18 @@ pub struct S2cRetryOptions {
     pub max_delay_seconds: u64,
     pub base_delay_ms: u64,
     pub max_attempts: Option<u32>,
+
 }
 
+impl S2cRetryOptions {
+    pub fn to_unlimited(&self) -> S2cRetryOptions {
+        S2cRetryOptions {
+            max_delay_seconds: self.max_delay_seconds,
+            base_delay_ms: self.base_delay_ms,
+            max_attempts: None
+        }
+    }
+}
 impl Default for S2cRetryOptions {
     fn default() -> Self {
         Self {

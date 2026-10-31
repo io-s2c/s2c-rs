@@ -1,6 +1,6 @@
 pub mod client;
-mod error;
+pub mod error;
 mod inflight;
-mod message_rw;
-mod server;
-mod group_server;
+pub mod message_rw;
+pub mod server;
+pub mod group_server;

@@ -1,77 +1,59 @@
 use crate::config::S2cOptions;
-use crate::network::message_rw::{write_message, S2cMessageReader};
-use crate::proto::io::s2c_message::Body;
-use crate::proto::io::s2c_message::Error::SlowDownError;
+use crate::fsm::MessageReaderFactory;
+use crate::network::client::MessageReader;
+use crate::network::message_rw::{write_bytes, S2cMessageReader};
 use crate::proto::io::{NodeIdentity, S2cMessage};
+use prost::Message;
 use std::collections::HashMap;
-use std::sync::atomic::Ordering::{AcqRel, Acquire, Release};
+use std::sync::atomic::Ordering::{AcqRel, Acquire};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::io::{BufReader, BufWriter};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::mpsc::{
-    channel, unbounded_channel, Receiver, Sender, UnboundedReceiver, UnboundedSender,
-};
+use tokio::sync::mpsc::{unbounded_channel, Receiver, UnboundedReceiver, UnboundedSender};
 use tokio::sync::{Mutex, RwLock};
+use tokio_util::bytes::{Bytes, BytesMut};
 use tokio_util::future::FutureExt;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
+use tracing::error;
 
 pub struct S2cMessageEnvelope {
-    s2c_message: S2cMessage,
-    node_identity: Arc<NodeIdentity>,
+    pub s2c_message: S2cMessage,
+    pub node_identity: Arc<NodeIdentity>,
 }
 
-pub struct GroupServer<T, F>
-where
-    T: S2cMessageReader + Send + 'static,
-    F: Fn() -> T,
-{
+pub struct GroupServer {
     group_id: String,
-    message_reader_factory: F,
-    follow_sender: Arc<Sender<S2cMessageEnvelope>>,
-    state_request_sender: Arc<Sender<S2cMessageEnvelope>>,
-    synchronize_sender: Arc<Sender<S2cMessageEnvelope>>,
-    inner_sender: Arc<Sender<S2cMessageEnvelope>>,
-    inner_receiver: Arc<Mutex<Receiver<S2cMessageEnvelope>>>,
+    message_reader_factory: MessageReaderFactory,
+    all_in: Arc<UnboundedSender<S2cMessageEnvelope>>,
+    all_out: Arc<Mutex<Receiver<S2cMessageEnvelope>>>,
     running: Arc<AtomicBool>,
     task_tracker: TaskTracker,
     cancellation_token: CancellationToken,
     inner_cancellation_token: CancellationToken,
-    clients_senders:
-        Arc<RwLock<HashMap<Arc<NodeIdentity>, Arc<UnboundedSender<S2cMessageEnvelope>>>>>,
+    clients_ins: Arc<RwLock<HashMap<Arc<NodeIdentity>, Arc<UnboundedSender<S2cMessageEnvelope>>>>>,
     s2c_options: &'static S2cOptions,
 }
 
-impl<T, F> GroupServer<T, F>
-where
-    T: S2cMessageReader + Send + 'static,
-    F: Fn() -> T,
-{
+impl GroupServer {
     pub fn new(
         group_id: String,
-        message_reader_factory: F,
-        follow_sender: Sender<S2cMessageEnvelope>,
-        state_request_sender: Sender<S2cMessageEnvelope>,
-        synchronize_sender: Sender<S2cMessageEnvelope>,
-        inner_sender: Arc<Sender<S2cMessageEnvelope>>,
-        inner_receiver: Receiver<S2cMessageEnvelope>,
+        message_reader_factory: MessageReaderFactory,
+        all_in: UnboundedSender<S2cMessageEnvelope>,
+        all_out: Receiver<S2cMessageEnvelope>,
         s2c_options: &'static S2cOptions,
     ) -> Self {
         Self {
             group_id,
             message_reader_factory,
-            follow_sender: Arc::new(follow_sender),
-            state_request_sender: Arc::new(state_request_sender),
-            synchronize_sender: Arc::new(synchronize_sender),
-            inner_sender,
-            inner_receiver: Arc::new(Mutex::new(inner_receiver)),
+            all_in: Arc::new(all_in),
+            all_out: Arc::new(Mutex::new(all_out)),
             running: Arc::new(AtomicBool::new(false)),
             cancellation_token: CancellationToken::new(),
             inner_cancellation_token: CancellationToken::new(),
             task_tracker: TaskTracker::new(),
-            clients_senders: Arc::new(RwLock::new(HashMap::new())),
+            clients_ins: Arc::new(RwLock::new(HashMap::new())),
             s2c_options,
         }
     }
@@ -83,18 +65,17 @@ where
             .is_ok()
         {
             let running = self.running.clone();
-            let inner_receiver = self.inner_receiver.clone();
+            let all_out = self.all_out.clone();
             let cancellation_token = self.cancellation_token.clone();
-            let cancellation_token2 = self.cancellation_token.clone();
             let inner_cancellation_token = self.inner_cancellation_token.clone();
-            let clients_map = self.clients_senders.clone();
+            let clients_map = self.clients_ins.clone();
             self.task_tracker.spawn(async move {
                 tokio::select! {
                     _ = cancellation_token.cancelled() => {
                         inner_cancellation_token.cancel();
                     }
-                    _ = Self::inner_drain_out(inner_receiver, running, clients_map)
-                    .with_cancellation_token(&cancellation_token2)
+                    _ = Self::inner_drain_out(all_out, running, clients_map)
+                    .with_cancellation_token(&cancellation_token)
                      => {
 
                     }
@@ -107,11 +88,11 @@ where
         &self,
         node_identity: NodeIdentity,
         reader: BufReader<OwnedReadHalf>,
-        mut writer: BufWriter<OwnedWriteHalf>,
+        writer: BufWriter<OwnedWriteHalf>,
     ) {
         if self.running.load(Acquire) {
             let node_identity = Arc::new(node_identity);
-            let mut map = self.clients_senders.write().await;
+            let mut map = self.clients_ins.write().await;
             if map.get(&node_identity).is_some() {
                 return;
             }
@@ -120,10 +101,7 @@ where
             drop(map);
 
             let message_reader = (self.message_reader_factory)();
-            let follow_sender = self.follow_sender.clone();
-            let synchronize_sender = self.synchronize_sender.clone();
-            let state_request_sender = self.state_request_sender.clone();
-            let inner_sender = self.inner_sender.clone();
+            let all_in = self.all_in.clone();
             let running = self.running.clone();
             let running2 = self.running.clone();
             let inner_cancellation_token = self.inner_cancellation_token.clone();
@@ -134,10 +112,7 @@ where
                 Self::start_read_loop(
                     reader,
                     message_reader,
-                    follow_sender,
-                    synchronize_sender,
-                    state_request_sender,
-                    inner_sender,
+                    all_in,
                     running,
                     node_identity,
                     cancellation_token,
@@ -154,55 +129,22 @@ where
     }
     async fn start_read_loop(
         mut reader: BufReader<OwnedReadHalf>,
-        mut message_reader: T,
-        follow_sender: Arc<Sender<S2cMessageEnvelope>>,
-        synchronize_sender: Arc<Sender<S2cMessageEnvelope>>,
-        state_request_sender: Arc<Sender<S2cMessageEnvelope>>,
-        inner_sender: Arc<Sender<S2cMessageEnvelope>>,
+        mut message_reader: MessageReader,
+        all_in: Arc<UnboundedSender<S2cMessageEnvelope>>,
         running: Arc<AtomicBool>,
         node_identity: Arc<NodeIdentity>,
         cancellation_token: CancellationToken,
     ) {
-        while running.load(Ordering::Relaxed) {
+        while running.load(Acquire) {
             match message_reader.read_next_message(&mut reader).await {
                 Ok(msg) => {
-                    if !running.load(Ordering::Relaxed) {
+                    if !running.load(Acquire) {
                         break;
                     }
-                    // follow_sender and synchronize_sender are unbounded
-                    if let Some(Body::Follow(_)) = msg.body {
-                        let _ = follow_sender.send(S2cMessageEnvelope {
-                            s2c_message: msg,
-                            node_identity: node_identity.clone(),
-                        });
-                    } else if let Some(Body::SynchronizeRequest(_)) = msg.body {
-                        let _ = synchronize_sender.send(S2cMessageEnvelope {
-                            s2c_message: msg,
-                            node_identity: node_identity.clone(),
-                        });
-                    } else if let Some(Body::StateRequest(_)) = msg.body {
-                        if let Err(err) = state_request_sender.try_send(S2cMessageEnvelope {
-                            s2c_message: msg,
-                            node_identity: node_identity.clone(),
-                        }) {
-                            if matches!(err, TrySendError::Full(_)) {
-                                if let Err(err2) = inner_sender
-                                    .send(S2cMessageEnvelope {
-                                        s2c_message: S2cMessage {
-                                            correlation_id: uuid::Uuid::new_v4().to_string(),
-                                            body: None,
-                                            error: Some(SlowDownError(Default::default())),
-                                        },
-                                        node_identity: node_identity.clone(),
-                                    })
-                                    .await
-                                {
-                                    tracing::debug!(error = %err, "Error while sending SlowDown message. Exiting read loop");
-                                    break;
-                                }
-                            }
-                        }
-                    }
+                    let _ = all_in.send(S2cMessageEnvelope {
+                        s2c_message: msg,
+                        node_identity: node_identity.clone(),
+                    });
                 }
 
                 Err(err) => {
@@ -220,10 +162,15 @@ where
         running: Arc<AtomicBool>,
         cancellation_token: CancellationToken,
     ) {
-        let mut buf = vec![0u8; 1024];
+        let mut buf = BytesMut::with_capacity(1024);
         while running.load(Acquire) {
             if let Some(msg) = receiver.recv().await {
-                if let Err(err) = write_message(&mut writer, msg.s2c_message, &mut buf).await {
+                buf.resize(msg.s2c_message.encoded_len(), 0u8);
+                if let Err(e) = msg.s2c_message.encode(&mut buf) {
+                    error!("Error while encoding message {:?}", msg.s2c_message);
+                    continue;
+                }
+                if let Err(err) = write_bytes(&mut writer, buf.split().freeze()).await {
                     tracing::debug!(err = %err, "Error while writing response. Exiting loop");
                     cancellation_token.cancel();
                     break;
@@ -233,29 +180,29 @@ where
     }
 
     async fn inner_drain_out(
-        inner_receiver: Arc<Mutex<Receiver<S2cMessageEnvelope>>>,
+        all_out: Arc<Mutex<Receiver<S2cMessageEnvelope>>>,
         running: Arc<AtomicBool>,
-        clients_senders: Arc<
+        clients_ins: Arc<
             RwLock<HashMap<Arc<NodeIdentity>, Arc<UnboundedSender<S2cMessageEnvelope>>>>,
         >,
     ) {
-        let mut local_client_senders: HashMap<
+        let mut local_client_ins: HashMap<
             Arc<NodeIdentity>,
             Arc<UnboundedSender<S2cMessageEnvelope>>,
         > = HashMap::new();
-        let mut inner_receiver = inner_receiver.lock().await;
+        let mut all_out = all_out.lock().await;
         while running.load(Ordering::Relaxed) {
-            match inner_receiver.recv().await {
+            match all_out.recv().await {
                 None => {
                     break;
                 }
-                Some(msg) => match local_client_senders.get(&msg.node_identity.clone()) {
+                Some(msg) => match local_client_ins.get(&msg.node_identity.clone()) {
                     Some(sender) => {
                         let _ = sender.send(msg);
                     }
-                    None => match clients_senders.read().await.get(&msg.node_identity) {
+                    None => match clients_ins.read().await.get(&msg.node_identity) {
                         Some(sender) => {
-                            local_client_senders.insert(msg.node_identity, sender.clone());
+                            local_client_ins.insert(msg.node_identity, sender.clone());
                         }
                         None => {
                             tracing::error!("No sender found for node identity");
