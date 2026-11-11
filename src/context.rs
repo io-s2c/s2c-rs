@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use crate::proto::io::{NodeIdentity, S2cMessage};
 
 pub struct Context {
@@ -32,12 +33,12 @@ impl Context {
         self.log_node_identity
     }
 
-    pub fn as_vec(&self) -> Vec<(&'static str, &str)> {
-        let mut vec = vec![("s2c_group_id", self.s2c_group_id.as_str())];
+    pub fn as_vec(&self) -> Vec<(Arc<str>, &str)> {
+        let mut vec = vec![(Arc::from("s2c_group_id"), self.s2c_group_id.as_str())];
         if self.log_node_identity {
-            vec.push(("node_id", self.node_identity.id.as_str()));
-            vec.push(("node_address", self.node_identity.address.as_str()));
-            vec.push(("node_port", self.port_str.as_str()))
+            vec.push((Arc::from("node_id"), self.node_identity.id.as_str()));
+            vec.push((Arc::from("node_address"), self.node_identity.address.as_str()));
+            vec.push((Arc::from("node_port"), self.port_str.as_str()))
         }
         vec
     }

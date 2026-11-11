@@ -1,46 +1,42 @@
-use crate::config::{S2cOptions, S2cRetryOptions};
+use crate::backoff::BackoffCounter;
+use crate::config::S2cOptions;
+use crate::context::Context;
+use crate::fsm::FsmState::Stopped;
+use crate::log::S2cLog;
 use crate::network::client::{MessageReader, S2cClient};
-use crate::network::group_server::{GroupServer, S2cMessageEnvelope};
+use crate::network::error::ClientError;
+use crate::network::group_server::S2cMessageEnvelope;
 use crate::network::server::S2cServer;
 use crate::paths::KeysResolver;
-use crate::proto::io::{
-    Batch, BatchEntry, LeaderState, LogEntry, NodeIdentity, NotLeaderError, S2cMessage,
-    StateRequest, ReplicateRequest, ReplicateResponse,
-};
-use std::ops::Sub;
-
-use crate::backoff::BackoffCounter;
-use crate::error::is_transient;
-use crate::log::S2cLog;
-use crate::network::error::ClientError;
 use crate::proto::io::s2c_message::Body;
 use crate::proto::io::s2c_message::Body::Follow;
+use crate::proto::io::{
+    Batch, BatchEntry, LeaderState, LogEntry, NodeIdentity, NotLeaderError, ReplicateResponse,
+    S2cMessage, StateRequest,
+};
+use crate::replicator::Replicator;
 use crate::sync_queue::ReplicateQueue;
 use object_store::{Error, ObjectStore};
 use prost::Message;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
-use tokio::sync::mpsc::{
-    channel, unbounded_channel, Receiver, Sender, UnboundedReceiver, UnboundedSender,
-};
-use tokio::time::{timeout, Instant};
-use tokio_stream::StreamExt;
+use std::time::Duration;
+use tokio::sync::mpsc::{Receiver, Sender, UnboundedReceiver, UnboundedSender};
+use tokio::time::{Instant, timeout};
 use tokio_util::bytes::Bytes;
-use tokio_util::task::TaskTracker;
 use tracing::{debug, error};
 use uuid::Uuid;
 
-enum FSMState {
-    NOT_JOINED,
-    FOLLOWER,
-    LEADER,
-    STOPPED, // End state
+enum FsmState {
+    NotJoined,
+    Follower,
+    Leader,
+    Stopped, // End state
 }
 
 pub type MessageReaderFactory = Arc<dyn Fn() -> MessageReader + Send + Sync>;
 
-struct FSM {
-    state: FSMState,
+struct Fsm {
+    state: FsmState,
     s2c_options: &'static S2cOptions,
     server: &'static S2cServer,
     client: &'static S2cClient,
@@ -53,17 +49,19 @@ struct FSM {
     group: String,
     node_identity: &'static NodeIdentity,
     message_reader_factory: MessageReaderFactory,
-    s2c_log: S2cLog,
+    s2c_log: Arc<S2cLog>,
     keys_resolver: KeysResolver,
     object_store: Arc<dyn ObjectStore>,
     missed_heartbeats: u32,
     commit_index: u64,
     apply_index: u64,
     epoch: u64,
-    followers: Vec<NodeIdentity>,
+    context: &'static Context,
+    followers: Vec<Replicator>,
+    commit_index_tx: tokio::sync::watch::Sender<u64>,
 }
 
-impl FSM {
+impl Fsm {
     pub fn new(
         group: String,
         server: &'static S2cServer,
@@ -77,11 +75,13 @@ impl FSM {
         object_store: Arc<dyn ObjectStore>,
         bucket: String,
         message_reader_factory: MessageReaderFactory,
-        s2c_log: S2cLog,
+        s2c_log: Arc<S2cLog>,
+        context: &'static Context,
     ) -> Self {
+        let (commit_index_tx, _) = tokio::sync::watch::channel(0);
         Self {
             bucket,
-            state: FSMState::NOT_JOINED,
+            state: FsmState::NotJoined,
             server,
             client,
             local_requests_tx: local_tx,
@@ -100,17 +100,19 @@ impl FSM {
             commit_index: 0,
             apply_index: 0,
             epoch: 0,
+            context,
             followers: Vec::new(),
+            commit_index_tx,
         }
     }
 
     async fn start(&mut self) {
         loop {
             match self.state {
-                FSMState::NOT_JOINED => self.join().await,
-                FSMState::FOLLOWER => self.follower_loop().await,
-                FSMState::LEADER => self.leader_loop().await,
-                FSMState::STOPPED => break,
+                FsmState::NotJoined => self.join().await,
+                FsmState::Follower => self.follower_loop().await,
+                FsmState::Leader => self.leader_loop().await,
+                FsmState::Stopped => break,
             }
         }
     }
@@ -123,10 +125,10 @@ impl FSM {
             )
             .await
             {
-                Err(e) => {
+                Err(_) => {
                     self.missed_heartbeats += 1;
                     if self.missed_heartbeats >= self.s2c_options.max_missed_heartbeats {
-                        self.state = FSMState::NOT_JOINED;
+                        self.state = FsmState::NotJoined;
                         return;
                     }
                 }
@@ -135,9 +137,16 @@ impl FSM {
                     match msg.s2c_message.body.take() {
                         Some(Body::ReplicateRequest(replicate)) => {
                             self.missed_heartbeats = 0;
-                            if replicate.commit_index == self.sync_queue.last_received_index() + 1
+                            let log_entry = LogEntry::decode(Bytes::from(replicate.log_entry))
+                                .expect("Invalid entry");
+                            if log_entry
+                                .leader_state
+                                .as_ref()
+                                .expect("invalid entry")
+                                .commit_index
+                                == self.sync_queue.last_received_index() + 1
                             {
-                                self.sync_queue.put(replicate);
+                                self.sync_queue.put(log_entry);
                             }
                             s2c_message = Some(S2cMessage {
                                 correlation_id: msg.s2c_message.correlation_id,
@@ -193,7 +202,41 @@ impl FSM {
         let flush_interval_nanos = Duration::from_millis(self.s2c_options.flush_interval_ms);
         let mut start = Instant::now();
         let batch_min_size = self.s2c_options.batch_min_count as usize;
+        // let
         loop {
+            tokio::select! {
+                next = self.next() => {
+                    let body = next.map_or(None, |envelope| envelope.s2c_message.body);
+                    match body {
+                        Some(Follow(follow)) => {
+                            let mut replicator = Replicator::new(
+                                self.s2c_log.clone(),
+                                follow
+                                    .node_identity
+                                    .expect("Invalid follow request")
+                                    .clone(),
+                                self.s2c_options,
+                                self.context,
+                                Arc::new(self.message_reader_factory.clone()),
+                                follow.apply_index,
+                                self.commit_index_tx.subscribe(),
+                            );
+                            replicator.start().await;
+                            self.followers.push(replicator);
+                      },
+                    Some(Body::StateRequest(state_request)) => {
+                        acc.push(state_request);
+                    }
+
+                    Some(_) => {
+                        // Irrelevant - ignore
+                    }
+                    None => {
+                        error!("Unexpected empty body")
+                    }
+                    }
+                },
+            }
             let mut due = Vec::new();
             let elapsed = start.elapsed();
             let remaining = flush_interval_nanos
@@ -223,10 +266,7 @@ impl FSM {
                     Some(Body::StateRequest(state_request)) => {
                         acc.push(state_request);
                     }
-                    Some(Follow(follow)) => self
-                        .followers
-                        .push(follow.node_identity.expect("Invalid follow request")),
-                    // Start follower replicator
+
                     Some(_) => {
                         // Irrelevant - ignore
                     }
@@ -242,27 +282,41 @@ impl FSM {
                     let mut ve = vec![0; state_request.encoded_len()];
                     state_request.encode(&mut ve).expect("Invalid entry");
                     entries.push(BatchEntry {
-                        body: ve,
+                        body: Bytes::from(ve),
                         internal: false,
                     });
                 });
                 let batch = Batch { entries };
-                // let log_entry = LogEntry {
-                //     batch,
-                //     leader_state: LeaderState {
-                //         node_identity: Some(self.node_identity.clone()),
-                //         followers: self.followers
-                //     }
-                // }
+                let commit_index = self.commit_index + 1;
+                let log_entry = LogEntry {
+                    batch: Some(batch),
+                    leader_state: Some(LeaderState {
+                        epoch: self.epoch,
+                        commit_index,
+                        node_identity: Some(self.node_identity.clone()),
+                    }),
+                };
+                let log_entry_bytes = Bytes::from(log_entry.encode_to_vec());
                 match self
                     .s2c_log
-                    .append(self.commit_index, Bytes::from(batch.encode_to_vec()))
+                    .append(commit_index, log_entry_bytes.clone())
                     .await
                 {
-                    Ok(_) => {}
-                    Err(e) => {}
+                    Ok(_) => {
+                        self.set_commit_index(commit_index);
+                        acc.clear();
+                    }
+                    Err(Error::AlreadyExists { .. }) => {
+                        // Another node took over leadership.
+                        self.state = FsmState::NotJoined;
+                        return;
+                    }
+                    Err(e) => {
+                        error!("Failed appending log entry. Stopping node. {:?}", e);
+                        self.state = Stopped;
+                        return;
+                    }
                 }
-                acc.clear();
                 start = Instant::now();
             }
         }
@@ -277,23 +331,22 @@ impl FSM {
     }
 
     async fn join(&mut self) {
-        let mut backoff = BackoffCounter::new(&self.s2c_options.retry);
-        while matches!(self.state, FSMState::NOT_JOINED) {
+        loop {
             match self.discover_leader_state().await {
                 Ok(Some(leader_state)) => {
                     let leader_identity = leader_state.node_identity.expect("Invalid leader state");
                     match self.connect(&leader_identity).await {
                         Ok(_) => match self.follow(&leader_identity).await {
-                            Ok(_) => self.state = FSMState::FOLLOWER,
-                            Err(ClientError::Closed | ClientError::NotConnected) => {
-                                error!("Wrong state")
+                            Ok(_) => self.state = FsmState::Follower,
+                            Err(ClientError::WrongState { client_state }) => {
+                                error!("Wrong state {:?}", client_state)
                             }
                             Err(e) => {
                                 self.attempt_leadership().await;
                             }
                         },
-                        Err(ClientError::Closed | ClientError::NotConnected) => {
-                            error!("Wrong state");
+                        Err(ClientError::WrongState { client_state }) => {
+                            error!("Wrong state {:?}", client_state);
                             return;
                         }
                         Err(e) => {
@@ -305,16 +358,8 @@ impl FSM {
                     self.attempt_leadership().await;
                 }
                 Err(e) => {
-                    if is_transient(&e) {
-                        if backoff.can_attempt() {
-                            backoff.await_attempt().await;
-                        } else {
-                            backoff.reset()
-                        }
-                    } else {
-                        error!("Non transient object store error");
-                        return;
-                    }
+                    error!("Non transient object store error {e}");
+                    break;
                 }
             }
         }
@@ -332,34 +377,20 @@ impl FSM {
                 commit_index,
                 node_identity: Some(self.node_identity.clone()),
                 epoch,
-                followers: Vec::new(),
             }),
         };
 
         let payload = Bytes::from(LogEntry::encode_to_vec(&log_entry));
-        let unlimited = self.s2c_options.retry.to_unlimited();
-        let mut backoff = BackoffCounter::new(&unlimited);
-        loop {
-            match self.s2c_log.append(commit_index, payload.clone()).await {
-                Ok(_) => {
-                    self.state = FSMState::LEADER;
-                    self.commit_index = commit_index;
-                    self.epoch = epoch;
-                    return;
-                }
-                Err(e @ object_store::Error::AlreadyExists { .. }) => {
-                    // debug!("")
-                    return;
-                }
-                Err(e) => {
-                    if is_transient(&e) {
-                        backoff.await_attempt().await;
-                    } else {
-                        error!("Unexpected error {e}");
-                        self.state = FSMState::STOPPED;
-                        return;
-                    }
-                }
+        match self.s2c_log.append(commit_index, payload).await {
+            Ok(_) => {
+                self.state = FsmState::Leader;
+                self.set_commit_index(commit_index);
+                self.epoch = epoch;
+            }
+            Err(Error::AlreadyExists { .. }) => {}
+            Err(e) => {
+                error!("Unexpected error {e}");
+                self.state = FsmState::Stopped;
             }
         }
     }
@@ -409,7 +440,7 @@ impl FSM {
             {
                 // We ignore the response here, but usually it can be used to get the NodeSequenceNumber
                 Ok(_) => return Ok(()),
-                Err(e @ ClientError::Io { .. }) => {
+                Err(e @ ClientError::NetworkError { .. }) => {
                     if send_backoff.can_attempt() {
                         send_backoff.await_attempt().await
                     } else {
@@ -421,30 +452,24 @@ impl FSM {
         }
     }
 
-    async fn discover_leader_state(&self) -> Result<Option<LeaderState>, Error> {
-        let mut backoff = BackoffCounter::new(&self.s2c_options.retry);
-        loop {
-            match self.s2c_log.get_head().await {
-                Ok(Some(head)) => match self.s2c_log.get_at(head).await {
-                    Ok(bytes) => return Ok(Some(parse_leader_state(bytes))),
-                    Err(e) => {
-                        if is_transient(&e) && backoff.can_attempt() {
-                            backoff.await_attempt().await;
-                        } else {
-                            return Err(e);
-                        }
-                    }
-                },
-                Ok(None) => return Ok(None),
-                Err(e) => {
-                    if is_transient(&e) && backoff.can_attempt() {
-                        backoff.await_attempt().await;
-                    } else {
-                        return Err(e);
-                    }
-                }
-            }
+    async fn discover_leader_state(&self) -> Result<Option<LeaderState>, Arc<Error>> {
+        match self.s2c_log.get_head().await {
+            Ok(Some(head)) => match self.s2c_log.get_at(head).await {
+                Ok(Some(bytes)) => Ok(Some(parse_leader_state(bytes))),
+                // We panic here because this would be a fatal correctness error.
+                // The head should never be truncated
+                Ok(None) => panic!("Entry at head not found"),
+                Err(e) => Err(e),
+            },
+            Ok(None) => Ok(None),
+            Err(e) => Err(Arc::from(e)),
         }
+    }
+    fn set_commit_index(&mut self, commit_index: u64) {
+        self.commit_index = commit_index;
+        self.commit_index_tx
+            .send(commit_index)
+            .expect("Commit index channel closed");
     }
 }
 

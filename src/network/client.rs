@@ -4,19 +4,20 @@ use crate::fsm::MessageReaderFactory;
 use crate::network::client::ClientState::{Closed, Connected, NotConnected, Ready};
 use crate::network::error::{ClientError, NetworkError};
 use crate::network::inflight::InflightRequests;
-use crate::network::message_rw::{write_bytes, S2cMessageReader};
+use crate::network::message_rw::{S2cMessageReader, write_bytes};
 use crate::proto::io::s2c_message::{Body, Error as S2cError};
 use crate::proto::io::{Handshake, NodeIdentity, S2cMessage};
 use prost::Message;
 use std::cmp::PartialEq;
 use std::error::Error;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::Duration;
 use tokio::io::{BufReader, BufWriter};
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
-use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::sync::mpsc::{Receiver, Sender, channel};
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::bytes::Bytes;
 use tokio_util::future::FutureExt;
@@ -24,15 +25,26 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use uuid::Uuid;
 
-#[derive(Eq, PartialEq, Debug)]
+#[derive(Eq, PartialEq, Debug, Clone)]
 #[repr(u8)]
-enum ClientState {
+pub enum ClientState {
     NotConnected,
     Connected,
     Ready,
     Closed,
 }
 
+impl fmt::Display for ClientState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            ClientState::NotConnected => "NotConnected",
+            ClientState::Connected => "Connected",
+            ClientState::Ready => "Ready",
+            ClientState::Closed => "Closed",
+        };
+        write!(f, "{}", s)
+    }
+}
 pub struct AtomicClientState(AtomicU8);
 
 pub type MessageReader = Box<dyn S2cMessageReader + 'static + Send + Sync>;
@@ -56,8 +68,7 @@ impl AtomicClientState {
     }
 }
 
-pub struct S2cClient
-{
+pub struct S2cClient {
     s2c_options: &'static S2cOptions,
     context: &'static Context,
     inflight_requests: Arc<InflightRequests>,
@@ -71,8 +82,7 @@ pub struct S2cClient
     cancellation_token: CancellationToken,
 }
 
-impl S2cClient
-{
+impl S2cClient {
     pub fn new(
         s2c_options: &'static S2cOptions,
         context: &'static Context,
@@ -110,7 +120,9 @@ impl S2cClient
             )
             .await
             .map_err(|_| ClientError::ConnectTimeout)?
-            .map_err(|e| ClientError::Io { err: NetworkError::Io { kind: e.kind(), msg: e.to_string() }})?;
+            .map_err(|e| ClientError::NetworkError {
+                err: NetworkError::Io { err: Arc::from(e) },
+            })?;
 
             self.client_state.store(Connected);
 
@@ -153,7 +165,9 @@ impl S2cClient
             let _guard = self.rw_lock.read().await;
             let state = self.client_state.load();
             if state == Closed {
-                return Err(ClientError::Closed);
+                return Err(ClientError::WrongState {
+                    client_state: state,
+                });
             }
             if state == NotConnected {
                 return Err(ClientError::NotConnected);
@@ -286,7 +300,7 @@ impl S2cClient
                 Err(e) => {
                     tracing::error!("Error while reading message {:?}", e.to_string());
                     inflight_requests
-                        .fail_all(ClientError::Io {err: e})
+                        .fail_all(ClientError::NetworkError { err: e })
                         .await;
                     cancellation_token.cancel();
                     client_state.store(NotConnected);
@@ -309,8 +323,10 @@ impl S2cClient
                 return;
             }
             if throttle.load(Ordering::Acquire) {
-                tokio::time::sleep(Duration::from_millis(s2c_options.network.throttle_delay_ms as u64))
-                    .await;
+                tokio::time::sleep(Duration::from_millis(
+                    s2c_options.network.throttle_delay_ms as u64,
+                ))
+                .await;
                 throttle.store(false, Ordering::Release);
             }
             match receiver.recv().await {

@@ -1,134 +1,74 @@
-use crate::backoff::BackoffCounter;
 use crate::config::S2cOptions;
-use crate::error::is_transient;
+use crate::object_read_write::ObjectReadWrite;
 use crate::paths::KeysResolver;
 use bytes::Bytes;
 
-use futures::StreamExt;
+use moka::future::Cache;
+use moka::policy::EvictionPolicy;
 use object_store::path::Path;
-use object_store::{
-    Attributes, Extensions, ObjectStore, ObjectStoreExt, PutMode, PutOptions,
-    PutPayload, PutResult, TagSet,
-};
+use object_store::{Error, PutResult};
 use std::sync::Arc;
 use tokio_util::bytes;
 
 pub struct S2cLog {
-    object_store: Arc<dyn ObjectStore>,
+    object_read_write: ObjectReadWrite,
     key_resolver: KeysResolver,
-    s2c_options: &'static S2cOptions,
+    cache: Cache<u64, Bytes>,
 }
 
 impl S2cLog {
     pub fn new(
-        object_store: Arc<dyn ObjectStore>,
+        object_read_write: ObjectReadWrite,
         group_id: String,
         s2c_options: &'static S2cOptions,
     ) -> Self {
         Self {
-            object_store,
+            object_read_write,
             key_resolver: KeysResolver::new(group_id),
-            s2c_options,
+            cache: Cache::builder()
+                .eviction_policy(EvictionPolicy::lru())
+                .max_capacity(s2c_options.log_lru_cache_size as u64)
+                .build(),
         }
     }
 
-    pub async fn append(
-        &self,
-        index: u64,
-        payload: Bytes,
-    ) -> Result<PutResult, object_store::Error> {
-        let mut backoff_counter = BackoffCounter::new(&self.s2c_options.retry);
-        loop {
-            match self
-                .object_store
-                .put_opts(
-                    &Path::from(self.key_resolver.log_entry(KeysResolver::invert(index))),
-                    PutPayload::from_bytes(payload.clone()),
-                    PutOptions {
-                        mode: PutMode::Create,
-                        tags: TagSet::default(),
-                        attributes: Attributes::default(),
-                        extensions: Extensions::default(),
-                    },
-                )
-                .await
-            {
-                Ok(re) => return Ok(re),
-                Err(e @ object_store::Error::AlreadyExists { .. }) => {
-                    return Err(e);
-                }
-                Err(e @ object_store::Error::Generic { .. }) => {
-                    if (is_transient(&e)) {
-                        if (backoff_counter.can_attempt()) {
-                            backoff_counter.await_attempt().await;
-                        } else {
-                            return Err(e);
-                        }
-                    }
-                }
-                Err(e) => {
-                    return Err(e);
-                }
-            }
-        }
+    pub async fn append(&self, index: u64, payload: Bytes) -> Result<PutResult, Error> {
+        let path = Path::from(self.key_resolver.log_entry(KeysResolver::invert(index)));
+        let result = self
+            .object_read_write
+            .put_if_absent(path, payload.clone())
+            .await?;
+        self.cache.insert(index, payload).await;
+        Ok(result)
     }
 
-    pub async fn get_head(&self) -> Result<Option<u64>, object_store::Error> {
-        let mut backoff_counter = BackoffCounter::new(&self.s2c_options.retry);
+    pub async fn get_head(&self) -> Result<Option<u64>, Error> {
         let prefix = Path::from(self.key_resolver.log_prefix());
-        let mut stream = self.object_store.list(Some(&prefix));
-        loop {
-            match stream.next().await {
-                None => return Ok(None),
-                Some(re) => match re {
-                    Err(e) => {
-                        if is_transient(&e) {
-                            if backoff_counter.can_attempt() {
-                                backoff_counter.await_attempt().await;
-                            }
-                        } else {
-                            return Err(e);
-                        }
-                    }
-                    Ok(obj) => {
-                        return Ok(obj
-                            .location
-                            .filename()
-                            .map(String::from)
-                            .map(|name| name.parse().expect("Not a valid index")));
-                    }
-                },
-            }
+        Ok(self
+            .object_read_write
+            .first_under_prefix(prefix)
+            .await?
+            .and_then(|location| location.filename().map(String::from))
+            .map(|name| name.parse().expect("Not a valid index")))
+    }
+
+    pub async fn get_at(&self, index: u64) -> Result<Option<Bytes>, Arc<Error>> {
+        match self.cache.try_get_with(index, self._get_at(index)).await {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(e) => match *e {
+                Error::NotFound { .. } => Ok(None),
+                _ => Err(e),
+            },
         }
     }
 
-    pub async fn get_at(&self, index: u64) -> Result<Bytes, object_store::Error> {
-        let path = self.key_resolver.log_entry(KeysResolver::invert(index));
-        let p = path.as_str();
-        let mut backoff_counter = BackoffCounter::new(&self.s2c_options.retry);
-        loop {
-            match self.object_store.get(&Path::from(p)).await {
-                Ok(re) => {
-                    backoff_counter.reset();
-                        match re.bytes().await {
-                            Ok(bytes) => return Ok(bytes),
-                            Err(e) => {
-                                if is_transient(&e) && backoff_counter.can_attempt() {
-                                    backoff_counter.await_attempt().await;
-                                } else {
-                                    return Err(e);
-                                }
-                            }
-                        }
-                }
-                Err(e) => {
-                    if is_transient(&e) && backoff_counter.can_attempt() {
-                        backoff_counter.await_attempt().await;
-                    } else {
-                        return Err(e)
-                    }
-                }
-            }
-        }
+    pub async fn delete_range(&self, start: u64, end: u64) -> Result<(), Error> {
+        let paths: Vec<Path> = (start..end).map(|n: u64| n.to_string().into()).collect();
+        self.object_read_write.delete(paths).await
+    }
+
+    async fn _get_at(&self, index: u64) -> Result<Bytes, Error> {
+        let path = Path::from(self.key_resolver.log_entry(KeysResolver::invert(index)));
+        self.object_read_write.read(path).await
     }
 }

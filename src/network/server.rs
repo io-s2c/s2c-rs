@@ -1,35 +1,51 @@
 use crate::backoff::BackoffCounter;
 use crate::config::{S2cOptions, S2cRetryOptions};
+use crate::network::error::ServerError;
 use crate::network::group_server::GroupServer;
-use crate::network::message_rw::{write_bytes, S2cMessageReader};
+use crate::network::message_rw::{S2cMessageReader, write_bytes};
 use crate::network::server::ServerState::{Binding, Closed, NotBound, Ready};
 use crate::proto::io::s2c_message::Body;
 use crate::proto::io::{Handshake, NodeIdentity, S2cMessage};
 use std::collections::HashMap;
+use std::fmt;
 
 use crate::fsm::MessageReaderFactory;
 use crate::network::client::MessageReader;
-use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
 use prost::Message;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::time::Duration;
 use tokio::io::{AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
+use tokio::task::JoinSet;
 use tokio::time;
 use tokio_util::bytes::Bytes;
 use tokio_util::future::FutureExt;
 use tokio_util::sync::CancellationToken;
-use tokio_util::task::TaskTracker;
+use tokio_util::task::{JoinMap, TaskTracker};
 
+#[derive(Clone, Debug)]
 #[repr(u8)]
-enum ServerState {
+pub enum ServerState {
     NotBound,
     Binding,
     Ready,
     Closed,
+}
+
+impl fmt::Display for ServerState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            NotBound => "NotBound",
+            Binding => "Binding",
+            Ready => "Ready",
+            Closed => "Closed",
+        };
+        write!(f, "{}", s)
+    }
 }
 
 #[derive(Debug)]
@@ -73,12 +89,11 @@ pub struct S2cServer {
     server_state: Arc<AtomicServerState>,
     node_identity: NodeIdentity,
     message_reader_factory: MessageReaderFactory,
-    task_tracker: TaskTracker,
+    join_set: JoinSet<()>,
     cancellation_token: CancellationToken,
 }
 
-impl S2cServer
-{
+impl S2cServer {
     pub fn new(
         s2c_options: &'static S2cOptions,
         node_identity: NodeIdentity,
@@ -90,38 +105,41 @@ impl S2cServer
             server_state: Arc::new(AtomicServerState::new()),
             node_identity,
             message_reader_factory,
-            task_tracker: TaskTracker::new(),
+            join_set: JoinSet::new(),
             cancellation_token: CancellationToken::new(),
         }
     }
 
-    pub async fn start(&mut self) -> Result<(), std::io::Error> {
+    pub async fn start(&mut self) -> Result<(), ServerError> {
         if self.server_state.compare_and_exchange(NotBound, Binding) {
             let server_state = self.server_state.clone();
             let port = self.node_identity.port;
             let s2c_options = self.s2c_options;
-            let tcp_listener = bind(self.node_identity.port, &self.s2c_options.retry).await?;
-            let cancellation_token = self.cancellation_token.clone();
+            let tcp_listener = bind(self.node_identity.port, &self.s2c_options.retry)
+                .await
+                .map_err(|e| ServerError::NetworkError {
+                    err: super::error::NetworkError::Io { err: e.into() },
+                })?;
             let message_reader_factory = self.message_reader_factory.clone();
             let group_servers = self.group_servers.clone();
+            let cancellation_token = self.cancellation_token.clone();
             server_state.store(Ready);
-            self.task_tracker.spawn(async move {
-                Self::serve(
-                    server_state,
-                    s2c_options,
-                    port,
-                    tcp_listener,
-                    cancellation_token,
-                    message_reader_factory,
-                    group_servers,
-                )
-                .await
-            });
 
-            Ok(())
+            Self::serve(
+                server_state,
+                s2c_options,
+                port,
+                tcp_listener,
+                message_reader_factory,
+                cancellation_token,
+                group_servers,
+            )
+            .await
         } else {
             tracing::warn!("Wrong state for starting server {:?}", self.server_state);
-            Ok(())
+            Err(ServerError::WrongState {
+                server_state: self.server_state.load(),
+            })
         }
     }
 
@@ -130,21 +148,18 @@ impl S2cServer
         s2c_options: &'static S2cOptions,
         port: i32,
         tcp_listener: TcpListener,
-        cancellation_token: CancellationToken,
         message_reader_factory: MessageReaderFactory,
+        cancellation_token: CancellationToken,
         group_servers: GroupServers,
-    ) {
-        let inner_task_tracker = TaskTracker::new();
-        let inner_cancellation_token = CancellationToken::new();
-
+    ) -> Result<(), ServerError> {
+        let mut inner_join_set: JoinSet<()> = JoinSet::new();
         tokio::select! {
             _ = cancellation_token.cancelled() => {
-                inner_cancellation_token.cancel();
-                inner_task_tracker.close();
-                inner_task_tracker.wait().await;
+                inner_join_set.shutdown().await;
+                Ok(())
             }
-            _ = Self::do_serve(server_state, s2c_options, port, &inner_task_tracker, tcp_listener, &inner_cancellation_token, message_reader_factory, group_servers) => {
-
+            re = Self::do_serve(server_state, s2c_options, port, &mut inner_join_set, tcp_listener, message_reader_factory, group_servers) => {
+                return re;
             }
         }
     }
@@ -153,27 +168,24 @@ impl S2cServer
         server_state: Arc<AtomicServerState>,
         s2c_options: &'static S2cOptions,
         port: i32,
-        task_tracker: &TaskTracker,
+        join_set: &mut JoinSet<()>,
         tcp_listener: TcpListener,
-        cancellation_token: &CancellationToken,
         message_reader_factory: MessageReaderFactory,
         group_servers: GroupServers,
-    ) {
+    ) -> Result<(), ServerError> {
         let mut tcp_listener = tcp_listener;
         loop {
             start_accept_loop(
                 &tcp_listener,
                 &*server_state,
-                task_tracker,
-                &cancellation_token,
+                join_set,
                 &message_reader_factory,
                 s2c_options,
                 group_servers.clone(),
             )
-            .with_cancellation_token(&cancellation_token)
             .await;
             if !server_state.compare_and_exchange(Ready, NotBound) {
-                return;
+                return Ok(());
             }
             if server_state.compare_and_exchange(NotBound, Binding) {
                 match bind(port, &s2c_options.retry).await {
@@ -184,16 +196,17 @@ impl S2cServer
                     Err(err) => {
                         tracing::error!("Error while rebinding {}. Closing client", err);
                         server_state.store(Closed);
-                        cancellation_token.cancel();
-                        task_tracker.close();
-                        // Await all client handlers.
-                        task_tracker.wait().await;
-                        return;
+
+                        return Err(ServerError::NetworkError {
+                            err: crate::network::error::NetworkError::Io { err: err.into() },
+                        });
                     }
                 }
             } else {
                 tracing::debug!("Couldn't rebind {:?}", server_state);
-                return;
+                return Err(ServerError::WrongState {
+                    server_state: server_state.load(),
+                });
             }
         }
     }
@@ -205,15 +218,13 @@ impl S2cServer
             .insert(group_id, group_server);
     }
 
-    pub async fn close(&self) {
+    pub async fn close(&mut self) {
         if matches!(self.server_state.load(), Closed) {
             tracing::warn!("Server already closed");
             return;
         }
         self.server_state.store(Closed);
-        self.cancellation_token.cancel();
-        self.task_tracker.close();
-        self.task_tracker.wait().await;
+        self.join_set.shutdown().await;
     }
 }
 
@@ -239,12 +250,11 @@ async fn bind(
 async fn start_accept_loop(
     tcp_listener: &TcpListener,
     server_state: &AtomicServerState,
-    task_tracker: &TaskTracker,
-    cancellation_token: &CancellationToken,
+    join_set: &mut JoinSet<()>,
     message_reader_factory: &MessageReaderFactory,
     s2c_options: &'static S2cOptions,
     group_servers: GroupServers,
-){
+) {
     loop {
         if matches!(server_state.load(), Closed) {
             return;
@@ -255,10 +265,9 @@ async fn start_accept_loop(
         }
         match re {
             Ok((tcp_stream, sock_addr)) => {
-                let cancellation_token = cancellation_token.clone();
                 let message_reader_factory = message_reader_factory.clone();
                 let group_servers = group_servers.clone();
-                task_tracker.spawn(async move {
+                join_set.spawn(async move {
                     handle_client(
                         tcp_stream,
                         sock_addr,
@@ -266,7 +275,6 @@ async fn start_accept_loop(
                         s2c_options,
                         group_servers,
                     )
-                    .with_cancellation_token(&cancellation_token)
                     .await;
                 });
             }

@@ -1,8 +1,8 @@
+use crate::proto::io::{LogEntry, ReplicateRequest};
 use std::collections::VecDeque;
-use crate::proto::io::ReplicateRequest;
 
 pub struct ReplicateQueue {
-    queue: VecDeque<ReplicateRequest>,
+    queue: VecDeque<LogEntry>,
     size: usize,
     last_received_index: u64,
 }
@@ -16,14 +16,18 @@ impl ReplicateQueue {
         }
     }
 
-    pub fn put(&mut self, synchronize_request: ReplicateRequest) {
+    pub fn put(&mut self, log_entry: LogEntry) {
         if self.queue.len() >= self.size {
-            self.last_received_index = synchronize_request.commit_index;
-            self.queue.push_back(synchronize_request);
+            self.last_received_index = log_entry
+                .leader_state
+                .as_ref()
+                .expect("Invalid entry")
+                .commit_index;
+            self.queue.push_back(log_entry);
         }
     }
 
-    pub fn pop(&mut self) -> Option<ReplicateRequest> {
+    pub fn pop(&mut self) -> Option<LogEntry> {
         self.queue.pop_front()
     }
 

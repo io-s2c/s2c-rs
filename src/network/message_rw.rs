@@ -1,9 +1,10 @@
 use crate::network::error::NetworkError;
 use crate::proto::io::S2cMessage;
+use async_trait::async_trait;
 use prost::Message;
 use std::collections::VecDeque;
 use std::io::{Error, ErrorKind};
-use async_trait::async_trait;
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio_util::bytes::Bytes;
@@ -48,7 +49,6 @@ where
     message_inspector: I,
 }
 
-
 impl<F, I> S2CMessageReaderTestWrapper<F, I>
 where
     F: FnMut() -> usize,
@@ -79,12 +79,12 @@ impl S2cMessageReader for S2CMessageReaderImpl {
         let msg_size = reader
             .read_u32()
             .await
-            .map_err(|e| NetworkError::Io { kind: e.kind(), msg: e.to_string() })?;
+            .map_err(|e| NetworkError::Io { err: Arc::from(e) })?;
         if msg_size > self.max_message_size {
             let mut skip_stream = reader.take(msg_size as u64);
             tokio::io::copy(&mut skip_stream, &mut tokio::io::sink())
                 .await
-                .map_err(|e| NetworkError::Io { kind: e.kind(), msg: e.to_string() })?;
+                .map_err(|e| NetworkError::Io { err: Arc::from(e) })?;
             return Err(NetworkError::MessageTooLarge {
                 size: msg_size,
                 max: self.max_message_size,
@@ -97,7 +97,7 @@ impl S2cMessageReader for S2CMessageReaderImpl {
         reader
             .read_exact(&mut self.buf[..msg_size as usize])
             .await
-            .map_err(|e| NetworkError::Io { kind: e.kind(), msg: e.to_string() })?;
+            .map_err(|e| NetworkError::Io { err: e.into() })?;
         S2cMessage::decode(&self.buf[..msg_size as usize])
             .map_err(|e| NetworkError::InvalidProtobuf { err: e.to_string() })
     }
@@ -133,7 +133,7 @@ where
                 match failure {
                     Failure::Io => {
                         return Err(NetworkError::Io {
-                            kind: ErrorKind::Other, msg: String::from("some msg"),
+                            err: std::io::Error::new(ErrorKind::Other, "error").into(),
                         });
                     }
                     Failure::Drop => {
@@ -146,9 +146,6 @@ where
         }
     }
 }
-
-
-
 
 pub async fn write_bytes(
     writer: &mut BufWriter<OwnedWriteHalf>,

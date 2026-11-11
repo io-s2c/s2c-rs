@@ -79,10 +79,8 @@ message ReplicateResponse {
 }
 
 message ReplicateRequest {
-  Batch batch = 1;
-  uint64 commit_index = 2;
-  string group_id = 3;
-  FollowerTooFarBehindError follower_too_far_behind_error = 4;
+  bytes log_entry = 1;
+  FollowerTooFarBehindError follower_too_far_behind_error = 2;
 }
 
 message InternalError {

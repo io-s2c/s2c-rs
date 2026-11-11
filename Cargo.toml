@@ -10,8 +10,8 @@ path = "src/lib.rs"
 [dependencies]
 prost = "0.14.3"
 thiserror = "2.0.18"
-tokio = { version = "1.52.3", features = ["full"] }
-moka = {version = "0.12", features = ["sync"]}
+tokio = { version = "1.54.1", features = ["full"] }
+moka = {version = "0.12", features = ["future"]}
 tracing = "0.1.44"
 uuid = { version = "1.23.1", features = ["v4"] }
 tokio-util = { version = "0.7.18", features = ["full"] }

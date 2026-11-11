@@ -2,11 +2,10 @@ syntax = "proto3";
 
 package io.s2c.model;
 
-message StateSnapshot {
-	uint64 start_apply_index = 1;
-	uint64 end_apply_index = 2;
-	uint64 leader_epoch = 3;
-  bytes body = 4;
+message Snapshot {
+	uint64 at_apply_index = 1;
+	uint64 leader_epoch = 2;
+  bytes body = 3;
 }
 
 message NodeIdentity {
@@ -39,7 +38,6 @@ message LeaderState {
   uint64 epoch = 1;
   uint64 commit_index = 2;
   NodeIdentity node_identity = 3;
-  repeated FollowerInfo followers = 4;
 }
 
 message S2CGroupStatus {
